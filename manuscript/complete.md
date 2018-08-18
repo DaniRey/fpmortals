@@ -634,6 +634,10 @@ A> `|>` is often called the *thrush operator* because of its uncanny resemblance
 A> the cute bird. Those who do not like symbolic operators can use the alias
 A> `.into`.
 
+C> Here you provide non-symbolic alternative, which I assume is also how you read the symbolic one aloud.
+C> I think it would help the reader a lot, by not only knowing how the symbolic operator is called, but also
+C> knowing how to pronounce it when reading code. I assume we all read code "aloud" in our head.
+
 This approach also works for `EitherT` (and others) as the inner
 context, but their lifting methods are more complex and require
 parameters. Scalaz provides monad transformers for a lot of its own
@@ -714,8 +718,8 @@ a simple thing does not exist in either the Java or Scala standard libraries:
   import scala.concurrent.duration._
   
   final case class Epoch(millis: Long) extends AnyVal {
-    def +(d: FiniteDuration): Epoch = Epoch(millis + d.toMillis)
-    def -(e: Epoch): FiniteDuration = (millis - e.millis).millis
+    def +(d: FiniteDuration): Epoch    = Epoch(millis + d.toMillis)
+    def diff(e: Epoch): FiniteDuration = (e.millis - millis).millis
   }
 ~~~~~~~~
 
@@ -803,30 +807,17 @@ algebras, and adds a *pending* field to track unfulfilled requests.
 Now we are ready to write our business logic, but we need to indicate
 that we depend on `Drone` and `Machines`.
 
-We can write the interface for the business logic
+We create a *module* to contain our main business logic. A module is
+pure and depends only on other modules, algebras and pure functions.
 
 {lang="text"}
 ~~~~~~~~
-  trait DynAgents[F[_]] {
-    def initial: F[WorldView]
-    def update(old: WorldView): F[WorldView]
-    def act(world: WorldView): F[WorldView]
-  }
+  final class DynAgents[F[_]](D: Drone[F], M: Machines[F])
+                             (implicit F: Monad[F]) {
 ~~~~~~~~
 
-and implement it with a *module*. A module depends only on other modules,
-algebras and pure functions, and can be abstracted over `F`. If an
-implementation of an algebraic interface is tied to a specific type, e.g. `IO`,
-it is called an *interpreter*.
-
-{lang="text"}
-~~~~~~~~
-  final class DynAgentsModule[F[_]: Monad](D: Drone[F], M: Machines[F])
-    extends DynAgents[F] {
-~~~~~~~~
-
-The `Monad` context bound means that `F` is *monadic*, allowing us to use `map`,
-`pure` and, of course, `flatMap` via `for` comprehensions.
+The implicit `Monad[F]` means that `F` is *monadic*, allowing us to
+use `map`, `pure` and, of course, `flatMap` via `for` comprehensions.
 
 We have access to the algebra of `Drone` and `Machines` as `D` and `M`,
 respectively. Using a single capital letter name is a common naming convention
@@ -886,7 +877,7 @@ assume that it failed and forget that we asked to do it.
     snap <- initial
     changed = symdiff(old.alive.keySet, snap.alive.keySet)
     pending = (old.pending -- changed).filterNot {
-      case (_, started) => (snap.time - started) >= 10.minutes
+      case (_, started) => started.diff(snap.time) >= 10.minutes
     }
     update = snap.copy(pending = pending)
   } yield update
@@ -946,9 +937,9 @@ As a financial safety net, all nodes should have a maximum lifetime of
         case WorldView(backlog, _, _, alive, pending, time) if alive.nonEmpty =>
           (alive -- pending.keys).collect {
             case (n, started)
-                if backlog == 0 && (time - started).toMinutes % 60 >= 58 =>
+                if backlog == 0 && started.diff(time).toMinutes % 60 >= 58 =>
               n
-            case (n, started) if (time - started) >= 5.hours => n
+            case (n, started) if started.diff(time) >= 5.hours => n
           }.toList.toNel
   
         case _ => None
@@ -1068,7 +1059,7 @@ state:
       def stop(node: MachineNode): MachineNode = { stopped += 1 ; node }
     }
   
-    val program = new DynAgentsModule[Id](D, M)
+    val program = new DynAgents[Id](D, M)
   }
 ~~~~~~~~
 
@@ -2212,10 +2203,11 @@ We will finish this chapter with a practical example of data modelling
 and typeclass derivation, combined with algebra / module design from
 the previous chapter.
 
-In our `drone-dynamic-agents` application, we must communicate with Drone and
-Google Cloud using JSON over REST. Both services use [OAuth2](https://tools.ietf.org/html/rfc6749) for authentication.
-There are many ways to interpret OAuth2, but we will focus on the version that
-works for Google Cloud (the Drone version is even simpler).
+In our `drone-dynamic-agents` application, we must communicate with
+Drone and Google Cloud using JSON over REST. Both services use [OAuth2](https://tools.ietf.org/html/rfc6749)
+for authentication. Although there are many ways to interpret OAuth2,
+we'll focus on the version that works for Google Cloud (the Drone
+version is even simpler).
 
 
 ### Description
@@ -2305,24 +2297,12 @@ responding with
   }
 ~~~~~~~~
 
-All userland requests to the server should include the header
-
-{lang="text"}
-~~~~~~~~
-  Authorization: Bearer BEARER_TOKEN
-~~~~~~~~
-
-after substituting the actual `BEARER<sub>TOKEN</sub>`.
-
 Google expires all but the most recent 50 *bearer tokens*, so the
 expiry times are just guidance. The *refresh tokens* persist between
 sessions and can be expired manually by the user. We can therefore
 have a one-time setup application to obtain the refresh token and then
 include the refresh token as configuration for the user's install of
 the headless server.
-
-Drone doesn't implement the `/auth` endpoint, or the refresh, and simply
-provides a `BEARER<sub>TOKEN</sub>` through their user interface.
 
 
 ### Data
@@ -2418,7 +2398,7 @@ decoder typeclasses:
     def toJson(obj: A): JsValue
   }
   
-  @typeclass trait JsDecoder[A] {
+  @typeclass trait JsDecoder[A] { self =>
     def fromJson(json: JsValue): String \/ A
   }
 ~~~~~~~~
@@ -2428,12 +2408,21 @@ comprehensions, whereas stdlib `Either` does not support `.flatMap` prior to
 Scala 2.12.
 
 We need instances of `JsDecoder[AccessResponse]` and `JsDecoder[RefreshResponse]`.
-We can do this by making use of a helper function:
+We can do this by making use of jsonformat's helper functions:
 
 {lang="text"}
 ~~~~~~~~
-  implicit class JsValueOps(j: JsValue) {
-    def getAs[A: JsDecoder](key: String): String \/ A = ...
+  object JsDecoder {
+    object ops {
+      implicit class JsValueExtras(j: JsValue) {
+        def asJsObject: String \/ JsObject = ...
+        def as[A: JsDecoder]: String \/ A = ...
+      }
+      implicit class JsObjectExtras(j: JsObject) {
+        def getAs[A: JsDecoder](key: String): String \/ A = ...
+      }
+    }
+    ...
   }
 ~~~~~~~~
 
@@ -2447,19 +2436,21 @@ always in the implicit scope:
   object AccessResponse {
     implicit val json: JsDecoder[AccessResponse] = j =>
       for {
-        acc <- j.getAs[String]("access_token")
-        tpe <- j.getAs[String]("token_type")
-        exp <- j.getAs[Long]("expires_in")
-        ref <- j.getAs[String]("refresh_token")
+        obj <- j.asJsObject
+        acc <- obj.getAs[String]("access_token")
+        tpe <- obj.getAs[String]("token_type")
+        exp <- obj.getAs[Long]("expires_in")
+        ref <- obj.getAs[String]("refresh_token")
       } yield AccessResponse(acc, tpe, exp, ref)
   }
   
   object RefreshResponse {
     implicit val json: JsDecoder[RefreshResponse] = j =>
       for {
-        acc <- j.getAs[String]("access_token")
-        tpe <- j.getAs[String]("token_type")
-        exp <- j.getAs[Long]("expires_in")
+        obj <- j.asJsObject
+        acc <- obj.getAs[String]("access_token")
+        tpe <- obj.getAs[String]("token_type")
+        exp <- obj.getAs[Long]("expires_in")
       } yield RefreshResponse(acc, tpe, exp)
   }
 ~~~~~~~~
@@ -2468,7 +2459,6 @@ We can then parse a string into an `AccessResponse` or a `RefreshResponse`
 
 {lang="text"}
 ~~~~~~~~
-  scala> import jsonformat._, JsDecoder.ops._
   scala> val json = JsParser("""
                        {
                          "access_token": "BEARER_TOKEN",
@@ -2514,23 +2504,22 @@ We need to provide typeclass instances for basic types:
     implicit val long: UrlEncodedWriter[Long] =
       (s => Refined.unsafeApply(s.toString))
   
-    implicit def ilist[K: UrlEncodedWriter, V: UrlEncodedWriter]
-      : UrlEncodedWriter[IList[(K, V)]] = { m =>
+    implicit def kvs[F[_]: Traverse, K: UrlEncodedWriter, V: UrlEncodedWriter]
+      : UrlEncodedWriter[F[(K, V)]] = { m =>
+      import ops._
       val raw = m.map {
-        case (k, v) => k.toUrlEncoded.value + "=" + v.toUrlEncoded.value
+        case (k, v) => s"${k.toUrlEncoded}=${v.toUrlEncoded}"
       }.intercalate("&")
-      Refined.unsafeApply(raw) // by deduction
+      Refined.unsafeApply(raw)
     }
-  
   }
 ~~~~~~~~
 
 We use `Refined.unsafeApply` when we can logically deduce that the contents of
 the string are already url encoded, bypassing any further checks.
 
-`ilist` is an example of simple typeclass derivation, much as we derived
-`Numeric[Complex]` from the underlying numeric representation. The
-`.intercalate` method is like `.mkString` but more general.
+`kvs` is an example of simple typeclass derivation, much as we derived
+`Numeric[Complex]` from the underlying numeric representation.
 
 A> `UrlEncodedWriter` is making use of the *Single Abstract Method* (SAM types)
 A> Scala language feature. The full form of the above is
@@ -2635,21 +2624,21 @@ responses must have a `JsDecoder` and our `POST` payload must have a
 ~~~~~~~~
   package http.client.algebra
   
-  trait JsonClient[F[_]] {
-    def get[A: JsDecoder](
-      uri: String Refined Url,
-      headers: IList[HttpHeader]
-    ): F[A]
+  final case class Response[T](header: HttpResponseHeader, body: T)
   
-    def postUrlencoded[P: UrlEncoded, A: JsDecoder](
+  trait JsonHttpClient[F[_]] {
+    def get[B: JsDecoder](
       uri: String Refined Url,
-      payload: P,
-      headers: IList[HttpHeader]
-    ): F[A]
+      headers: List[HttpHeader] = Nil
+    ): F[Response[B]]
+  
+    def postUrlencoded[A: UrlEncoded, B: JsDecoder](
+      uri: String Refined Url,
+      payload: A,
+      headers: List[HttpHeader] = Nil
+    ): F[Response[B]]
   }
 ~~~~~~~~
-
-Note that we only define the happy path in the `JsonClient` API. We will get around to error handling in a later chapter.
 
 {lang="text"}
 ~~~~~~~~
@@ -2700,7 +2689,7 @@ and then write an OAuth2 client:
   )(
     implicit
     user: UserInteraction[F],
-    client: JsonClient[F],
+    client: JsonHttpClient[F],
     clock: LocalClock[F]
   ) {
     def authenticate: F[CodeToken] =
@@ -2717,9 +2706,10 @@ and then write an OAuth2 client:
                                  code.redirect_uri,
                                  config.clientId,
                                  config.clientSecret).pure[F]
-        msg     <- client.postUrlencoded[AccessRequest, AccessResponse](
+        response <- client.postUrlencoded[AccessRequest, AccessResponse](
                      config.access, request)
         time    <- clock.now
+        msg     = response.body
         expires = time + msg.expires_in.seconds
         refresh = RefreshToken(msg.refresh_token)
         bearer  = BearerToken(msg.access_token, expires)
@@ -2730,9 +2720,10 @@ and then write an OAuth2 client:
         request <- RefreshRequest(config.clientSecret,
                                   refresh.token,
                                   config.clientId).pure[F]
-        msg     <- client.postUrlencoded[RefreshRequest, RefreshResponse](
+        response <- client.postUrlencoded[RefreshRequest, RefreshResponse](
                      config.refresh, request)
         time    <- clock.now
+        msg     = response.body
         expires = time + msg.expires_in.seconds
         bearer  = BearerToken(msg.access_token, expires)
       } yield bearer
@@ -2769,8 +2760,8 @@ programming in general. Most names follow the conventions introduced
 in the Haskell programming language, based on *Category Theory*. Feel
 free to set up `type` aliases in your own codebase if you would prefer
 to use verbs based on the primary functionality of the typeclass (e.g.
-`Mappable`, `Pureable`, `FlatMappable`) until you are comfortable with
-the standard names.
+`Mappable`, `Pureable`, `FlatMappable`).
+C> removed "..until your comfortable..", as it implies having a different opinion on names is the wrong opinion.
 
 Before we introduce the typeclass hierarchy, we will peek at the four
 most important methods from a control flow perspective: the methods we
@@ -2863,6 +2854,7 @@ scalaz source code.
 
 A> `|+|` is known as the TIE Fighter operator. There is an Advanced TIE
 A> Fighter in an upcoming section, which is very exciting.
+A> It is pronounced "append".
 
 A `Semigroup` should exist for a type if two elements can be combined
 to produce another element of the same type. The operation must be
@@ -2931,6 +2923,26 @@ ADT.
     payments: List[java.time.LocalDate],
     ccy: Option[Currency],
     otc: Option[Boolean]
+  )
+~~~~~~~~
+
+C> I struggled with this example for two reasons. It doesn't make much sense to me, to append multiple TradeTemplates. 
+C> I don't think TradeTemplates of different Currencies should be appendable.
+C> Also, I didn't know what OTC means (after looking it up, it is probably "over the counter").
+C> Maybe you could use a different example, for example a Bid. 
+C> Assuming that the Bids would be appended in correct order, this could make sense.
+
+{lang="text"}
+~~~~~~~~
+  type Name = String
+  sealed abstract class BidderKind
+  case object Remote extends BidderKind
+  case object Local extends BidderKind
+  
+  final case class Bid (
+    bids: List[Int],
+    highest: Option[Name],
+    kind: Option[BidderKind]
   )
 ~~~~~~~~
 
@@ -3121,8 +3133,8 @@ successors and predecessors:
   
     @op("|->" ) def fromToL(from: F, to: F): List[F] = ...
     @op("|-->") def fromStepToL(from: F, step: Int, to: F): List[F] = ...
-    @op("|=>" ) def fromToL(from: F, to: F): EphemeralStream[F] = ...
-    @op("|==>") def fromStepToL(from: F, step: Int, to: F): EphemeralStream[F] = ...
+    @op("|=>" ) def fromTo(from: F, to: F): EphemeralStream[F] = ...
+    @op("|==>") def fromStepTo(from: F, step: Int, to: F): EphemeralStream[F] = ...
   }
 ~~~~~~~~
 
@@ -3136,8 +3148,13 @@ successors and predecessors:
 ~~~~~~~~
 
 A> `|==>` is scalaz's Lightsaber. This is the syntax of a Functional
-A> Programmer. Not as clumsy or random as `fromStepToL`. An elegant
+A> Programmer. Not as clumsy or random as `fromStepTo`. An elegant
 A> syntax... for a more civilised age.
+
+C> A bit strange that you describe `|==>` but your example uses `|-->`
+C> Honestly, I think the syntax of the default Scala way to define a range `10 to 20 by 2` is easier to read.
+C> I see how much more can be done with Enum, then with a Scala Range. But I think "elegant construction", 
+C> is not where it makes the difference.
 
 We'll discuss `EphemeralStream` in the next chapter, for now you just
 need to know that it is a potentially infinite data structure that
@@ -3450,6 +3467,9 @@ We now know this is silly and we should have written:
 `.fold` doesn't work on stdlib `List` because it already has a method
 called `fold` that does it is own thing in its own special way.
 
+C> Maybe start a new sub-chapter to talk about `intercalate`. And maybe even turn the explenation on its head.
+C> Start talking about `mkString` and then about the generalised version called `intercalate`.
+
 The strangely named `intercalate` inserts a specific `A` between each
 element before performing the `fold`
 
@@ -3541,6 +3561,8 @@ for example
 
 noting that there are two parts indexed by `f`.
 
+C> Can you elaborate why `splitBy` returns an IList instead of a Map `==>>`?
+
 `splitByRelation` avoids the need for an `Equal` but we must provide
 the comparison operator.
 
@@ -3624,6 +3646,8 @@ First there are methods that take a `Semigroup` instead of a `Monoid`:
 returning `Option` to account for empty data structures (recall that
 `Semigroup` does not have a `zero`).
 
+C> recall that `Semigroup` ... was very helpful!
+
 A> The methods read "one-Option", not `10 pt` as in typesetting.
 
 The typeclass `Foldable1` contains a lot more `Semigroup` variants of
@@ -3684,6 +3708,8 @@ and `sequence` for swapping around type constructors to fit a
 requirement (e.g. `List[Future[_]]` to `Future[List[_]]`). You will
 use these methods more than you could possibly imagine.
 
+C> Been there and immediately understood your point. But I assume for many an example would be great.
+
 In `Foldable` we weren't able to assume that `reverse` was a universal
 concept, but now we can reverse a thing.
 
@@ -3699,6 +3725,8 @@ into a new type, and then returning just an `F[C]`.
 `mapAccumL` and `mapAccumR` are regular `map` combined with an
 accumulator. If you find your old Java sins are making you want to
 reach for a `var`, and refer to it from a `map`, you want `mapAccumL`.
+
+C> I love this sentence about `mapAccumL`. I felt like:"finally someone showing me a clean solution to that problem."
 
 For example, let's say we have a list of words and we want to blank
 out words we've already seen. The filtering algorithm is not allowed
@@ -3735,6 +3763,7 @@ methods for data structures that cannot be empty, accepting the weaker
 `Semigroup` instead of a `Monoid`, and an `Apply` instead of an
 `Applicative`.
 
+C> Maybe repeat that the difference is, that they do not have to have `zero` or `point`.
 
 ### Align
 
@@ -3750,7 +3779,7 @@ looking at `Align`, meet the `\&/` data type (spoken as *These*, or
   final case class Both[A, B](aa: A, bb: B) extends (A \&/ B)
 ~~~~~~~~
 
-i.e. it is a data encoding of inclusive logical `OR`.
+i.e. it is a data encoding of inclusive logical `OR`. A or B or Both.
 
 {lang="text"}
 ~~~~~~~~
@@ -4497,6 +4526,10 @@ type parameter. Such values are called *universally quantified*. For example,
 the `Divisible[Equal].conquer[String]` returns a trivial implementation of
 `Equal` that always returns `true`, which allows us to implement `contramap` in
 terms of `divide`
+
+C> I read this multiple times and I don't understand it. As far as I understand
+C> `Divisible[Equal].conquer[String]` provides and implementation of Equal for String, 
+C> which always returns true. But I can't follow the implementation of `contramap`.
 
 {lang="text"}
 ~~~~~~~~
@@ -6487,8 +6520,7 @@ wrote `logic.scala` before we learnt about `Applicative` and now we know better:
 
 {lang="text"}
 ~~~~~~~~
-  final class DynAgentsModule[F[_]: Applicative](D: Drone[F], M: Machines[F])
-    extends DynAgents[F] {
+  final class DynAgents[F[_]: Applicative](D: Drone[F], M: Machines[F]) {
     ...
     def act(world: WorldView): F[WorldView] = world match {
       case NeedsAgent(node) =>
@@ -6530,7 +6562,7 @@ name of the function that is called:
       def stop(node: MachineNode): F[Unit]         = Const("stop")
     }
   
-    val program = new DynAgentsModule[F](D, M)
+    val program = new DynAgents[F](D, M)
   }
 ~~~~~~~~
 
@@ -6578,7 +6610,7 @@ wrapped version of `act`
       def start(node: MachineNode): F[Unit]        = Const(Set.empty)
       def stop(node: MachineNode): F[Unit]         = Const(Set(node))
     }
-    val monitor = new DynAgentsModule[F](D, M)
+    val monitor = new DynAgents[F](D, M)
   
     def act(world: WorldView): U[(WorldView, Set[MachineNode])] = {
       val stopped = monitor.act(world).getConst
@@ -8378,36 +8410,6 @@ Our unit tests for `.stars` might cover these cases:
 As we've now seen several times, we can focus on testing the pure business logic
 without distraction.
 
-Finally, if we return to our `JsonClient` algebra from Chapter 4.3
-
-{lang="text"}
-~~~~~~~~
-  trait JsonClient[F[_]] {
-    def get[A: JsDecoder](
-      uri: String Refined Url,
-      headers: IList[(String, String)]
-    ): F[A]
-    ...
-  }
-~~~~~~~~
-
-recall that we only coded the happy path into the API. If our interpreter for
-this algebra only works for an `F` having a `MonadError` we get to define the
-kinds of errors as a tangential concern. Indeed, we can have ****two**** layers of
-error if we define the interpreter for a `EitherT[IO, JsonClient.Error, ?]`
-
-{lang="text"}
-~~~~~~~~
-  object JsonClient {
-    sealed abstract class Error
-    final case class ServerError(status: Int)       extends Error
-    final case class DecodingError(message: String) extends Error
-  }
-~~~~~~~~
-
-which cover I/O (network) problems, server status problems, and issues with our
-modelling of the server's JSON payloads.
-
 
 #### Choosing an error type
 
@@ -8969,7 +8971,7 @@ interpreters for our application and we stored the number of `started` and
   
     implicit val drone: Drone[Id] = new Drone[Id] { ... }
     implicit val machines: Machines[Id] = new Machines[Id] { ... }
-    val program = new DynAgentsModule[Id]
+    val program = new DynAgents[Id]
   }
 ~~~~~~~~
 
@@ -9040,7 +9042,7 @@ services, may be implemented like this:
         modify(w => w.copy(stopped = w.stopped + node))
     }
   
-    val program = new DynAgentsModule[F](D, M)
+    val program = new DynAgents[F](D, M)
   }
 ~~~~~~~~
 
@@ -10594,8 +10596,7 @@ Luckily, our main business logic only requires an `Applicative`, recall
 
 {lang="text"}
 ~~~~~~~~
-  final class DynAgentsModule[F[_]: Applicative](D: Drone[F], M: Machines[F])
-      extends DynAgents[F] {
+  final class DynAgents[F[_]: Applicative](D: Drone[F], M: Machines[F]) {
     def act(world: WorldView): F[WorldView] = ...
     ...
   }
@@ -10618,14 +10619,14 @@ To begin, we create the `lift` boilerplate for the `Batch` algebra
   }
 ~~~~~~~~
 
-and then we'll create an instance of `DynAgentsModule` with `FreeAp` as the context
+and then we'll create an instance of `DynAgents` with `FreeAp` as the context
 
 {lang="text"}
 ~~~~~~~~
   type Orig[a] = Coproduct[Machines.Ast, Drone.Ast, a]
   
   val world: WorldView = ...
-  val program = new DynAgentsModule(Drone.liftA[Orig], Machines.liftA[Orig])
+  val program = new DynAgents(Drone.liftA[Orig], Machines.liftA[Orig])
   val freeap  = program.act(world)
 ~~~~~~~~
 
@@ -11491,3 +11492,4 @@ accounting for the extra `E`:
 7.  `IO` can perform effects in parallel and provides a high performance implementation of the MTL.
 
 
+C> It would be great to end with a list of links to open-source projects, which make idiomatic use of Scalaz. This would give the reader an oportunity to see all those concepts in a larger context.
